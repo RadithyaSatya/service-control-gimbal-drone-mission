@@ -1,4 +1,9 @@
-# siyi_sdk
+# siyi_sdk (Legacy)
+
+> [!IMPORTANT]
+> **A newer, async-native version of this SDK is available in the [`siyi-sdk-v2`](https://github.com/mzahana/siyi_sdk/tree/siyi-sdk-v2) branch.**
+> It is recommended to use the new version for better performance, type safety, and modern asyncio support.
+
 Python implementation of the SDK of SIYI camera-gimbal systems.
 
 
