@@ -6,11 +6,17 @@
 
 Python implementation of the SDK of SIYI camera-gimbal systems.
 
-
 * [Camera-gimbal products](https://shop.siyi.biz/collections/gimbal-camera-optical-pod)
 * Documentation: [A8 mini](https://siyi.biz/siyi_file/A8%20mini/A8%20mini%20User%20Manual%20v1.6.pdf)
 
 **If you find this code useful, kindly give a STAR to this repository. Thanks!**
+
+# Components
+This repo now contains three related parts:
+
+* Core SIYI Python SDK in `siyi_sdk.py`
+* WebSocket bridge service in `gimbal_ws_bridge.py`
+* Static frontend for gimbal and camera control in `gimbal-control/`
 
 # Setup
 * Clone this package
@@ -45,10 +51,160 @@ Python implementation of the SDK of SIYI camera-gimbal systems.
     python3 gui/tkgui.py
     ```
 
-
     <video src="gui/demo.mp4" controls title="Demo"></video>
     
     <img src="gui/gui_tkinter.png" width=200> </img>
+
+# WebSocket Bridge
+`gimbal_ws_bridge.py` bridges backend realtime WebSocket with:
+
+* MAVLink gimbal control for pitch/yaw rotation
+* SIYI SDK camera control for photo, recording, and zoom
+
+Flow:
+
+1. service requests WS token from backend using `X-Device-Token`
+2. service connects to `GET /ws/telemetry?token=<WS_TOKEN>`
+3. service subscribes to `gimbal_command` and optionally `camera_command`
+4. service reads `GIMBAL_DEVICE_ATTITUDE_STATUS` from MAVLink UDP
+5. service publishes `gimbal_state`
+6. service translates `camera_command` to SIYI SDK calls and publishes `camera_state`
+
+## Run The Bridge
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python3 gimbal_ws_bridge.py
+```
+
+## Environment
+The bridge loads `.env` automatically. Default values are already provided in the root `.env`.
+
+Important variables:
+
+```bash
+API_BASE_URL=http://127.0.0.1:8000
+DEVICE_TOKEN=uav-local-dev-token
+UAV_ID=1
+
+MAVLINK_ENDPOINT=udpin:0.0.0.0:14551
+MAVLINK_SOURCE_SYSTEM=250
+MAVLINK_SOURCE_COMPONENT=191
+MAVLINK_GIMBAL_SYSTEM=1
+MAVLINK_GIMBAL_COMPONENT=1
+MAVLINK_GIMBAL_DEVICE_ID=0
+
+SIYI_ENABLED=true
+SIYI_IP=192.168.144.25
+SIYI_PORT=37260
+
+GIMBAL_COMMAND_METRIC=gimbal_command
+GIMBAL_STATE_METRIC=gimbal_state
+CAMERA_COMMAND_METRIC=camera_command
+CAMERA_STATE_METRIC=camera_state
+```
+
+Notes:
+
+* `MAVLINK_ENDPOINT` is the UDP stream the bridge listens to for gimbal telemetry.
+* `MAVLINK_SOURCE_*` is the sender identity used by this bridge when transmitting MAVLink commands.
+* `MAVLINK_GIMBAL_*` is the target identity used for `MAV_CMD_DO_GIMBAL_MANAGER_PITCHYAW`.
+* `SIYI_ENABLED=true` enables camera control through the SIYI SDK.
+
+## Realtime Metrics
+
+Gimbal path:
+
+* `gimbal_command`
+* `gimbal_state`
+
+Camera path:
+
+* `camera_command`
+* `camera_state`
+
+References:
+
+* `WEBSOCKET_CONTRACT.md`
+* `gimbal-ws-contract.md`
+
+# Gimbal Control Frontend
+`gimbal-control/` is a static frontend for:
+
+* gimbal pitch/yaw control via `gimbal_command`
+* camera actions via `camera_command`
+* live state display from `gimbal_state` and `camera_state`
+
+## Run The Frontend
+
+1. Open `gimbal-control/index.html` directly in the browser, or serve the folder using a static server
+2. Fill `Backend Base URL` and `Device Token`
+3. Click `Connect`
+4. Use the joystick for gimbal rotation
+5. Use the camera panel for `take picture`, `start/stop record`, `toggle record`, and `zoom`
+
+## Frontend Messages
+
+Gimbal command:
+
+```json
+{
+  "type": "publish",
+  "uav_id": 1,
+  "kind": "telemetry",
+  "metric": "gimbal_command",
+  "payload": {
+    "command": "set_pitch_yaw",
+    "pitch_deg": -12,
+    "yaw_deg": 63,
+    "mode": "follow",
+    "gimbal_device_id": 0
+  }
+}
+```
+
+Camera command:
+
+```json
+{
+  "type": "publish",
+  "uav_id": 1,
+  "kind": "telemetry",
+  "metric": "camera_command",
+  "payload": {
+    "command": "set_recording",
+    "enabled": true
+  }
+}
+```
+
+Subscribe:
+
+```json
+{
+  "type": "subscribe",
+  "uav_ids": [1],
+  "metrics": ["gimbal_state", "camera_state"]
+}
+```
+
+## Camera Commands Supported
+
+* `take_photo`
+* `toggle_recording`
+* `set_recording` with `enabled: true|false`
+* `zoom_in`
+* `zoom_out`
+* `zoom_stop`
+* `set_zoom_level` with `zoom_level`
+
+## Frontend Notes
+
+* The joystick flow still uses only `gimbal_command`; camera actions do not change the existing rotation contract.
+* Initial target is taken from live `gimbal_state`, not forced to `0,0` on connect.
+* For fuller frontend guidance, see `gimbal-control/FE_INTEGRATION.md`.
 
 # Video Streaming
 ## Requirements
