@@ -1,4 +1,8 @@
 import logging
+import math
+import shutil
+import socket
+import subprocess
 import threading
 from dataclasses import dataclass
 from time import sleep
@@ -14,6 +18,12 @@ class SiyiCameraSettings:
     port: int = 37260
     connect_max_wait_time: float = 3.0
     connect_max_retries: int = 3
+    reconnect_delay_seconds: float = 5.0
+    ping_enabled: bool = True
+    ping_timeout_seconds: float = 1.0
+    tcp_probe_enabled: bool = True
+    tcp_probe_port: int = 82
+    tcp_probe_timeout_seconds: float = 1.0
 
 
 class SiyiCameraService:
@@ -31,9 +41,61 @@ class SiyiCameraService:
         self._lock = threading.RLock()
         self._sdk: SIYISDK | None = None
         self._connected = False
+        self._last_healthcheck_log: str | None = None
+
+    def _ping_host(self) -> bool:
+        ping_path = shutil.which("ping")
+        if ping_path is None:
+            self.logger.warning("ping binary not found, skipping ICMP reachability check")
+            return True
+
+        timeout_seconds = max(1, int(math.ceil(self.settings.ping_timeout_seconds)))
+        command = [ping_path, "-c", "1", "-W", str(timeout_seconds), self.settings.ip]
+        result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        return result.returncode == 0
+
+    def _probe_tcp_port(self) -> bool:
+        try:
+            with socket.create_connection(
+                (self.settings.ip, self.settings.tcp_probe_port),
+                timeout=self.settings.tcp_probe_timeout_seconds,
+            ):
+                return True
+        except OSError:
+            return False
+
+    def healthcheck(self) -> bool:
+        if not self.settings.enabled:
+            return False
+
+        if self.settings.ping_enabled and not self._ping_host():
+            message = f"camera host {self.settings.ip} is not reachable via ping"
+            if self._last_healthcheck_log != message:
+                self.logger.warning("%s", message)
+                self._last_healthcheck_log = message
+            return False
+
+        if self.settings.tcp_probe_enabled and not self._probe_tcp_port():
+            message = f"camera host {self.settings.ip} TCP port {self.settings.tcp_probe_port} is not reachable"
+            if self._last_healthcheck_log != message:
+                self.logger.warning("%s", message)
+                self._last_healthcheck_log = message
+            return False
+
+        if self._last_healthcheck_log is not None:
+            self.logger.info(
+                "camera healthcheck recovered for %s:%s",
+                self.settings.ip,
+                self.settings.port,
+            )
+            self._last_healthcheck_log = None
+        return True
 
     def connect(self) -> bool:
         if not self.settings.enabled:
+            return False
+
+        if not self.healthcheck():
             return False
 
         with self._lock:

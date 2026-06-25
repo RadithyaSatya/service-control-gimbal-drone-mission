@@ -104,6 +104,12 @@ class Settings:
     siyi_port: int = env_int("SIYI_PORT", 37260)
     siyi_connect_max_wait_time: float = env_float("SIYI_CONNECT_MAX_WAIT_TIME", 3.0)
     siyi_connect_max_retries: int = env_int("SIYI_CONNECT_MAX_RETRIES", 3)
+    siyi_reconnect_delay_seconds: float = env_float("SIYI_RECONNECT_DELAY_SECONDS", 5.0)
+    siyi_ping_enabled: bool = env_bool("SIYI_PING_ENABLED", True)
+    siyi_ping_timeout_seconds: float = env_float("SIYI_PING_TIMEOUT_SECONDS", 1.0)
+    siyi_tcp_probe_enabled: bool = env_bool("SIYI_TCP_PROBE_ENABLED", False)
+    siyi_tcp_probe_port: int = env_int("SIYI_TCP_PROBE_PORT", 82)
+    siyi_tcp_probe_timeout_seconds: float = env_float("SIYI_TCP_PROBE_TIMEOUT_SECONDS", 1.0)
     camera_command_metric: str = os.getenv("CAMERA_COMMAND_METRIC", "camera_command")
     camera_state_metric: str = os.getenv("CAMERA_STATE_METRIC", "camera_state")
     camera_state_interval_seconds: float = env_float("CAMERA_STATE_INTERVAL_SECONDS", 1.0)
@@ -268,6 +274,12 @@ class GimbalBridge:
                     port=settings.siyi_port,
                     connect_max_wait_time=settings.siyi_connect_max_wait_time,
                     connect_max_retries=settings.siyi_connect_max_retries,
+                    reconnect_delay_seconds=settings.siyi_reconnect_delay_seconds,
+                    ping_enabled=settings.siyi_ping_enabled,
+                    ping_timeout_seconds=settings.siyi_ping_timeout_seconds,
+                    tcp_probe_enabled=settings.siyi_tcp_probe_enabled,
+                    tcp_probe_port=settings.siyi_tcp_probe_port,
+                    tcp_probe_timeout_seconds=settings.siyi_tcp_probe_timeout_seconds,
                 )
             )
 
@@ -561,12 +573,23 @@ class GimbalBridge:
         if self.camera is None:
             return
 
-        connected = await asyncio.to_thread(self.camera.connect)
-        if not connected:
-            logger.warning("SIYI camera bridge is enabled but initial connection failed")
-
         while not self.stop_event.is_set():
             try:
+                if not await asyncio.to_thread(self.camera.is_connected):
+                    connected = await asyncio.to_thread(self.camera.connect)
+                    if not connected:
+                        logger.warning(
+                            "SIYI camera is not reachable yet, retrying in %.1fs",
+                            self.camera.settings.reconnect_delay_seconds,
+                        )
+                        await self.publish_metric(
+                            self.settings.camera_state_metric,
+                            {"connected": False},
+                            self.settings.camera_state_interval_seconds,
+                        )
+                        await asyncio.sleep(self.camera.settings.reconnect_delay_seconds)
+                        continue
+
                 payload = await asyncio.to_thread(self.camera.snapshot_state, True)
                 await self.publish_metric(
                     self.settings.camera_state_metric,
