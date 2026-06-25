@@ -1,0 +1,19 @@
+[Unit]
+Description=Service Control Gimbal Drone Mission WebSocket Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=me
+Group=me
+WorkingDirectory=/home/me/drone10a/service-control-gimbal-drone-mission
+ExecStart=/home/me/drone10a/service-control-gimbal-drone-mission/.venv/bin/python /home/me/drone10a/service-control-gimbal-drone-mission/gimbal_ws_bridge.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHON_COLORS=0
+Environment=NO_COLOR=1
+
+[Install]
+WantedBy=multi-user.target

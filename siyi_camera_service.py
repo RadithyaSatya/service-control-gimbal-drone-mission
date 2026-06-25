@@ -37,9 +37,20 @@ class SiyiCameraService:
             return False
 
         with self._lock:
-            if self._connected and self._sdk is not None:
+            if self._connected and self._sdk is not None and self._sdk.isConnected():
                 return True
 
+            stale_sdk = self._sdk
+            self._sdk = None
+            self._connected = False
+
+        if stale_sdk is not None:
+            try:
+                stale_sdk.disconnect()
+            except Exception as exc:
+                self.logger.warning("error while cleaning up stale SIYI connection: %s", exc)
+
+        with self._lock:
             sdk = SIYISDK(server_ip=self.settings.ip, port=self.settings.port, debug=False)
             connected = sdk.connect(
                 maxWaitTime=self.settings.connect_max_wait_time,
@@ -57,6 +68,10 @@ class SiyiCameraService:
             self._connected = True
             self.logger.info("connected to SIYI camera at %s:%s", self.settings.ip, self.settings.port)
             return True
+
+    def reconnect(self) -> bool:
+        self.disconnect()
+        return self.connect()
 
     def disconnect(self) -> None:
         with self._lock:
@@ -91,8 +106,18 @@ class SiyiCameraService:
             sdk = self._sdk
             connected = self._connected and sdk is not None and sdk.isConnected()
             if not connected:
+                self._connected = False
+
+        if not connected:
+            if refresh and self.reconnect():
+                with self._lock:
+                    sdk = self._sdk
+                    connected = self._connected and sdk is not None and sdk.isConnected()
+            if not connected:
                 return {"connected": False}
 
+        with self._lock:
+            assert sdk is not None
             if refresh:
                 try:
                     self._refresh_state_locked(sdk)
