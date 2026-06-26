@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import signal
+import shutil
 import threading
 import time
 from urllib.parse import urlsplit, urlunsplit
@@ -17,6 +18,9 @@ from pymavlink import mavutil
 from siyi_camera_service import SiyiCameraService, SiyiCameraSettings
 
 load_dotenv()
+
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+LOCAL_MEDIA_ROOT = os.path.join(PROJECT_ROOT, "downloads")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -45,6 +49,15 @@ def env_bool(name: str, default: bool) -> bool:
     if value is None or value == "":
         return default
     return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def infer_media_type(file_path: str) -> str | None:
+    extension = os.path.splitext(file_path)[1].lower()
+    if extension in {".jpg", ".jpeg", ".png", ".webp"}:
+        return "image"
+    if extension in {".mp4", ".m4", ".m4v"}:
+        return "video"
+    return None
 
 
 def is_nan(value: Any) -> bool:
@@ -85,6 +98,8 @@ def quaternion_to_euler_degrees(q: list[float]) -> tuple[float, float, float]:
 
 @dataclass
 class Settings:
+    MEDIA_DELIVERY_MODES = {"local_only", "upload", "register_move"}
+
     api_base_url: str = os.getenv("API_BASE_URL", "http://68.183.224.114:8081")
     ws_url: str = os.getenv("WS_URL", "")
     device_token: str = os.getenv("DEVICE_TOKEN", "uav-local-dev-token")
@@ -116,6 +131,12 @@ class Settings:
     backend_connect_retry_seconds: float = env_float("BACKEND_CONNECT_RETRY_SECONDS", 5.0)
     mission_event_camera_actions_enabled: bool = env_bool("MISSION_EVENT_CAMERA_ACTIONS_ENABLED", True)
     mission_event_metric: str = os.getenv("MISSION_EVENT_METRIC", "mission_event")
+    mission_post_landing_media_enabled: bool = env_bool("MISSION_POST_LANDING_MEDIA_ENABLED", False)
+    mission_post_landing_media_download_enabled: bool = env_bool("MISSION_POST_LANDING_MEDIA_DOWNLOAD_ENABLED", True)
+    mission_post_landing_media_format_enabled: bool = env_bool("MISSION_POST_LANDING_MEDIA_FORMAT_ENABLED", True)
+    mission_post_landing_media_timeout_sec: float = env_float("MISSION_POST_LANDING_MEDIA_TIMEOUT_SEC", 120.0)
+    mission_camera_media_delivery_mode: str = os.getenv("MISSION_CAMERA_MEDIA_DELIVERY_MODE", "local_only").strip().lower()
+    mission_camera_media_register_root: str = os.getenv("MISSION_CAMERA_MEDIA_REGISTER_ROOT", "").strip()
 
     @property
     def resolved_ws_url(self) -> str:
@@ -249,6 +270,10 @@ class GimbalBridge:
     GIMBAL_MANAGER_FLAGS_YAW_IN_EARTH_FRAME = 64
 
     def __init__(self, settings: Settings):
+        if settings.mission_camera_media_delivery_mode not in Settings.MEDIA_DELIVERY_MODES:
+            raise ValueError(
+                f"unsupported MISSION_CAMERA_MEDIA_DELIVERY_MODE={settings.mission_camera_media_delivery_mode!r}"
+            )
         self.settings = settings
         self.backend = BackendRealtimeClient(settings)
         self.stop_event = asyncio.Event()
@@ -266,6 +291,8 @@ class GimbalBridge:
         self.last_waypoint_reached_action_key: tuple[int | None, int | None, int | None, int | None, str] | None = None
         self.active_recording_waypoint_key: tuple[int | None, int | None, int | None, int | None, str] | None = None
         self.recording_stop_task: asyncio.Task | None = None
+        self.active_media_processing_history_id: int | None = None
+        self.last_completed_media_processing_history_id: int | None = None
         self.camera = None
         if settings.siyi_enabled:
             self.camera = SiyiCameraService(
@@ -283,6 +310,93 @@ class GimbalBridge:
                     tcp_probe_timeout_seconds=settings.siyi_tcp_probe_timeout_seconds,
                 )
             )
+
+    def _backend_headers(self) -> dict[str, str]:
+        return {"X-Device-Token": self.settings.device_token}
+
+    def _upload_downloaded_media(self, history_id: int, downloaded_files: list[str], timeout_seconds: float) -> dict[str, Any]:
+        uploaded_count = 0
+        failed_count = 0
+        errors: list[str] = []
+
+        for file_path in downloaded_files:
+            media_type = infer_media_type(file_path)
+            if media_type is None:
+                failed_count += 1
+                errors.append(f"{os.path.basename(file_path)}: unsupported media extension")
+                continue
+
+            with open(file_path, "rb") as file_handle:
+                response = requests.post(
+                    f"{self.settings.api_base_url.rstrip('/')}/mission-history/{history_id}/media/upload",
+                    headers=self._backend_headers(),
+                    data={"uav_id": str(self.settings.uav_id), "media_type": media_type},
+                    files={"file": (os.path.basename(file_path), file_handle)},
+                    timeout=timeout_seconds,
+                )
+
+            if not response.ok:
+                failed_count += 1
+                errors.append(f"{os.path.basename(file_path)}: upload failed with status {response.status_code}")
+                continue
+
+            uploaded_count += 1
+
+        return {
+            "delivery_ok": failed_count == 0,
+            "delivered_file_count": uploaded_count,
+            "delivery_failed_file_count": failed_count,
+            "delivery_errors": errors,
+        }
+
+    def _register_move_downloaded_media(self, history_id: int, downloaded_files: list[str], timeout_seconds: float) -> dict[str, Any]:
+        register_root = self.settings.mission_camera_media_register_root
+        if not register_root:
+            raise RuntimeError("MISSION_CAMERA_MEDIA_REGISTER_ROOT is required for register_move mode")
+
+        register_root_abs = os.path.abspath(register_root)
+        history_media_root = os.path.join(register_root_abs, f"history-{history_id}", "media")
+        os.makedirs(history_media_root, exist_ok=True)
+
+        items: list[dict[str, str]] = []
+        moved_count = 0
+        errors: list[str] = []
+
+        for file_path in downloaded_files:
+            media_type = infer_media_type(file_path)
+            if media_type is None:
+                errors.append(f"{os.path.basename(file_path)}: unsupported media extension")
+                continue
+
+            target_path = os.path.join(history_media_root, os.path.basename(file_path))
+            if os.path.abspath(file_path) != os.path.abspath(target_path):
+                shutil.move(file_path, target_path)
+            storage_rel_path = os.path.relpath(target_path, register_root_abs)
+            items.append(
+                {
+                    "media_type": media_type,
+                    "media_role": "attachment",
+                    "storage_rel_path": storage_rel_path,
+                }
+            )
+            moved_count += 1
+
+        response = requests.post(
+            f"{self.settings.api_base_url.rstrip('/')}/mission-history/{history_id}/media/register",
+            headers={**self._backend_headers(), "Content-Type": "application/json"},
+            json={"items": items},
+            timeout=timeout_seconds,
+        )
+        if not response.ok:
+            raise RuntimeError(f"media register failed with status {response.status_code}")
+
+        return {
+            "delivery_ok": len(errors) == 0,
+            "delivered_file_count": moved_count,
+            "delivery_failed_file_count": len(errors),
+            "delivery_errors": errors,
+            "register_root": register_root_abs,
+        }
 
     def _send_gimbal_command(
         self,
@@ -385,11 +499,166 @@ class GimbalBridge:
             self.settings.camera_state_interval_seconds,
         )
 
-    async def _handle_mission_event(self, payload: dict[str, Any]) -> None:
-        if not self.settings.mission_event_camera_actions_enabled:
+    async def _publish_mission_event(self, payload: dict[str, Any]) -> None:
+        await self.backend.publish(self.settings.mission_event_metric, payload)
+
+    async def _process_post_landing_media(self, payload: dict[str, Any]) -> None:
+        if not self.settings.mission_post_landing_media_enabled:
             return
 
+        history_id = payload.get("history_id")
+        try:
+            history_id_value = int(history_id)
+        except (TypeError, ValueError):
+            logger.warning("ignoring media processing request without valid history_id: %r", history_id)
+            return
+
+        if self.active_media_processing_history_id == history_id_value:
+            logger.info("media processing already in progress for history_id=%s", history_id_value)
+            return
+        if self.last_completed_media_processing_history_id == history_id_value:
+            logger.info("ignoring duplicate media processing request for history_id=%s", history_id_value)
+            return
+
+        self.active_media_processing_history_id = history_id_value
+        started_at = time.monotonic()
+        local_root = LOCAL_MEDIA_ROOT
+        history_media_dir = os.path.join(local_root, f"history-{history_id_value}", "media")
+        delivery_mode = self.settings.mission_camera_media_delivery_mode
+        download_ok = None
+        delivery_ok = None
+        format_ok = None
+        downloaded_file_count = 0
+        failed_file_count = 0
+        delivered_file_count = 0
+        delivery_failed_file_count = 0
+        failure_reason = None
+        result_event = "media_processing_completed"
+
+        try:
+            if self.camera is None:
+                raise RuntimeError("SIYI camera is disabled")
+            if not self.settings.mission_post_landing_media_download_enabled and not self.settings.mission_post_landing_media_format_enabled:
+                raise RuntimeError("media processing is enabled but both download and format steps are disabled")
+            if delivery_mode != "local_only" and not self.settings.mission_post_landing_media_download_enabled:
+                raise RuntimeError("download step must be enabled for upload/register_move delivery mode")
+
+            if self.settings.mission_post_landing_media_download_enabled:
+                download_result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.camera.download_media,
+                        history_media_dir,
+                        self.settings.mission_post_landing_media_timeout_sec,
+                    ),
+                    timeout=self.settings.mission_post_landing_media_timeout_sec,
+                )
+                download_ok = bool(download_result.get("download_ok"))
+                downloaded_file_count = int(download_result.get("downloaded_file_count", 0) or 0)
+                failed_file_count = int(download_result.get("failed_file_count", 0) or 0)
+                if not download_ok and failed_file_count > 0:
+                    failure_reason = "; ".join(download_result.get("errors", [])[:3]) or "one or more media downloads failed"
+                downloaded_files = list(download_result.get("downloaded_files", []))
+
+                if delivery_mode == "upload":
+                    elapsed = time.monotonic() - started_at
+                    remaining = self.settings.mission_post_landing_media_timeout_sec - elapsed
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError()
+                    delivery_result = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self._upload_downloaded_media,
+                            history_id_value,
+                            downloaded_files,
+                            remaining,
+                        ),
+                        timeout=remaining,
+                    )
+                    delivery_ok = bool(delivery_result.get("delivery_ok"))
+                    delivered_file_count = int(delivery_result.get("delivered_file_count", 0) or 0)
+                    delivery_failed_file_count = int(delivery_result.get("delivery_failed_file_count", 0) or 0)
+                    if not delivery_ok and failure_reason is None:
+                        failure_reason = "; ".join(delivery_result.get("delivery_errors", [])[:3]) or "media upload failed"
+                elif delivery_mode == "register_move":
+                    elapsed = time.monotonic() - started_at
+                    remaining = self.settings.mission_post_landing_media_timeout_sec - elapsed
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError()
+                    delivery_result = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self._register_move_downloaded_media,
+                            history_id_value,
+                            downloaded_files,
+                            remaining,
+                        ),
+                        timeout=remaining,
+                    )
+                    delivery_ok = bool(delivery_result.get("delivery_ok"))
+                    delivered_file_count = int(delivery_result.get("delivered_file_count", 0) or 0)
+                    delivery_failed_file_count = int(delivery_result.get("delivery_failed_file_count", 0) or 0)
+                    if not delivery_ok and failure_reason is None:
+                        failure_reason = "; ".join(delivery_result.get("delivery_errors", [])[:3]) or "media register failed"
+                else:
+                    delivery_ok = True
+            else:
+                delivery_ok = True
+
+            if self.settings.mission_post_landing_media_format_enabled:
+                elapsed = time.monotonic() - started_at
+                remaining = self.settings.mission_post_landing_media_timeout_sec - elapsed
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                format_result = await asyncio.wait_for(
+                    asyncio.to_thread(self.camera.format_sd_card),
+                    timeout=remaining,
+                )
+                format_ok = bool(format_result.get("format_ok"))
+                if not format_ok and failure_reason is None:
+                    failure_reason = "format SD card reported failure"
+
+            if (download_ok is False or delivery_ok is False or format_ok is False) and result_event != "media_processing_timeout":
+                result_event = "media_processing_failed"
+        except asyncio.TimeoutError:
+            result_event = "media_processing_timeout"
+            failure_reason = "media processing exceeded configured timeout"
+        except Exception as exc:
+            result_event = "media_processing_failed"
+            if failure_reason is None:
+                failure_reason = str(exc)
+            logger.warning("post-landing media processing failed for history_id=%s: %s", history_id_value, exc)
+        finally:
+            confirmation_payload = compact_payload(
+                {
+                    "history_id": history_id_value,
+                    "event": result_event,
+                    "message": {
+                        "media_processing_completed": "Media processing finished",
+                        "media_processing_failed": "Media processing finished with errors",
+                        "media_processing_timeout": "Media processing timed out",
+                    }[result_event],
+                    "media_delivery_mode": delivery_mode,
+                    "media_download_ok": download_ok,
+                    "media_delivery_ok": delivery_ok,
+                    "media_format_ok": format_ok,
+                    "downloaded_file_count": downloaded_file_count,
+                    "failed_file_count": failed_file_count,
+                    "delivered_file_count": delivered_file_count,
+                    "delivery_failed_file_count": delivery_failed_file_count,
+                    "download_root": history_media_dir if self.settings.mission_post_landing_media_download_enabled else None,
+                    "failure_reason": failure_reason,
+                }
+            )
+            await self._publish_mission_event(confirmation_payload)
+            self.active_media_processing_history_id = None
+            self.last_completed_media_processing_history_id = history_id_value
+
+    async def _handle_mission_event(self, payload: dict[str, Any]) -> None:
         event = str(payload.get("event", "")).strip().lower()
+        if event == "media_processing_requested":
+            await self._process_post_landing_media(payload)
+            return
+
+        if not self.settings.mission_event_camera_actions_enabled:
+            return
         if event != "waypoint_reached":
             return
 
