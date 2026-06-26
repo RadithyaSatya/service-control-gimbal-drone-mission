@@ -265,6 +265,7 @@ class GimbalBridge:
         self.last_published_payloads: dict[str, dict[str, Any]] = {}
         self.last_waypoint_reached_action_key: tuple[int | None, int | None, int | None, int | None, str] | None = None
         self.active_recording_waypoint_key: tuple[int | None, int | None, int | None, int | None, str] | None = None
+        self.recording_stop_task: asyncio.Task | None = None
         self.camera = None
         if settings.siyi_enabled:
             self.camera = SiyiCameraService(
@@ -389,7 +390,7 @@ class GimbalBridge:
             return
 
         event = str(payload.get("event", "")).strip().lower()
-        if event not in ("waypoint_reached", "waypoint_hold_finished"):
+        if event != "waypoint_reached":
             return
 
         action = str(payload.get("waypoint_action", "")).strip()
@@ -426,21 +427,6 @@ class GimbalBridge:
             action.lower(),
         )
 
-        if event == "waypoint_hold_finished":
-            if action.lower() != "record video":
-                return
-            if self.active_recording_waypoint_key != action_key:
-                logger.info(
-                    "ignoring hold_finished for non-active recording waypoint action=%s active=%s",
-                    action_key,
-                    self.active_recording_waypoint_key,
-                )
-                return
-            await self._handle_camera_command({"command": "set_recording", "enabled": False})
-            logger.info("stopped recording for waypoint action=%s on waypoint_hold_finished", action_key)
-            self.active_recording_waypoint_key = None
-            return
-
         if action_key == self.last_waypoint_reached_action_key:
             return
 
@@ -455,12 +441,51 @@ class GimbalBridge:
             logger.warning("ignoring unsupported waypoint action=%s", action)
             return
 
+        if self.active_recording_waypoint_key == action_key:
+            return
+
+        duration = payload.get("waypoint_hold_time", payload.get("waypoint_action_duration"))
+        try:
+            duration_seconds = float(duration)
+        except (TypeError, ValueError):
+            logger.warning("record video waypoint requires numeric hold duration, got=%r", duration)
+            return
+        if duration_seconds <= 0:
+            logger.warning("record video waypoint requires hold duration > 0, got=%s", duration_seconds)
+            return
+
+        if self.recording_stop_task is not None:
+            self.recording_stop_task.cancel()
+            self.recording_stop_task = None
+
         await self._handle_camera_command({"command": "set_recording", "enabled": True})
         self.active_recording_waypoint_key = action_key
-        logger.info(
-            "started recording for waypoint action=%s on waypoint_reached, waiting for waypoint_hold_finished",
-            action_key,
+        self.recording_stop_task = asyncio.create_task(
+            self._stop_recording_after(duration_seconds, action_key)
         )
+        logger.info(
+            "started recording for waypoint action=%s on waypoint_reached, stopping after %.2fs",
+            action_key,
+            duration_seconds,
+        )
+
+    async def _stop_recording_after(
+        self,
+        duration_seconds: float,
+        waypoint_key: tuple[int | None, int | None, int | None, int | None, str],
+    ) -> None:
+        try:
+            await asyncio.sleep(duration_seconds)
+            if self.active_recording_waypoint_key != waypoint_key:
+                return
+            await self._handle_camera_command({"command": "set_recording", "enabled": False})
+            logger.info("stopped recording for waypoint action=%s after %.2fs", waypoint_key, duration_seconds)
+            self.active_recording_waypoint_key = None
+            self.recording_stop_task = None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("failed to stop recording for waypoint action=%s: %s", waypoint_key, exc)
 
     async def handle_ws_message(self, raw_message: str) -> None:
         try:
@@ -623,6 +648,8 @@ class GimbalBridge:
 
     async def shutdown(self) -> None:
         self.stop_event.set()
+        if self.recording_stop_task is not None:
+            self.recording_stop_task.cancel()
         if self.camera is not None:
             await asyncio.to_thread(self.camera.disconnect)
         if self.backend.websocket is not None:
