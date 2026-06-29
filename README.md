@@ -113,6 +113,7 @@ GIMBAL_COMMAND_METRIC=gimbal_command
 GIMBAL_STATE_METRIC=gimbal_state
 CAMERA_COMMAND_METRIC=camera_command
 CAMERA_STATE_METRIC=camera_state
+MISSION_EVENT_CAMERA_ACTION_ETA_OFFSET_SECONDS=0
 ```
 
 Notes:
@@ -121,6 +122,14 @@ Notes:
 * `MAVLINK_SOURCE_*` is the sender identity used by this bridge when transmitting MAVLink commands.
 * `MAVLINK_GIMBAL_*` is the target identity used for `MAV_CMD_DO_GIMBAL_MANAGER_PITCHYAW`.
 * `SIYI_ENABLED=true` enables camera control through the SIYI SDK.
+* `MISSION_EVENT_CAMERA_ACTION_ETA_OFFSET_SECONDS` can be used to fire mission camera actions slightly earlier than ETA, to compensate command latency.
+* `MISSION_SNAPSHOT_REFRESH_INTERVAL_SECONDS` controls how often the bridge refreshes the active mission snapshot from backend when waypoint runtime data is needed.
+
+Mission camera actions:
+
+* The bridge reads waypoint actions from the active mission snapshot returned by `GET /missions/safe-to-fly/device`.
+* Runtime prediction uses official realtime metrics: `mission_progress.current_waypoint`, `location.latitude/longitude/ground_speed`, and `vehicle_state.flight_speed`.
+* `take picture` and `record video` are scheduled from ETA computed as `distance_to_waypoint / speed`, not from a custom `waypoint_reached` event payload.
 
 ## Realtime Metrics
 
