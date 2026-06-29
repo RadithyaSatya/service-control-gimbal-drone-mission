@@ -152,17 +152,14 @@ class Settings:
     camera_state_interval_seconds: float = env_float("CAMERA_STATE_INTERVAL_SECONDS", 1.0)
     backend_connect_retry_seconds: float = env_float("BACKEND_CONNECT_RETRY_SECONDS", 5.0)
     mission_event_camera_actions_enabled: bool = env_bool("MISSION_EVENT_CAMERA_ACTIONS_ENABLED", True)
-    mission_event_camera_action_eta_offset_seconds: float = env_float(
-        "MISSION_EVENT_CAMERA_ACTION_ETA_OFFSET_SECONDS", 0.0
+    mission_waypoint_action_trigger_distance_meters: float = env_float(
+        "MISSION_WAYPOINT_ACTION_TRIGGER_DISTANCE_METERS", 3.0
     )
     mission_snapshot_refresh_interval_seconds: float = env_float(
         "MISSION_SNAPSHOT_REFRESH_INTERVAL_SECONDS", 2.0
     )
     mission_event_metric: str = os.getenv("MISSION_EVENT_METRIC", "mission_event")
     mission_status_metric: str = os.getenv("MISSION_STATUS_METRIC", "mission_status")
-    mission_progress_metric: str = os.getenv("MISSION_PROGRESS_METRIC", "mission_progress")
-    location_metric: str = os.getenv("LOCATION_METRIC", "location")
-    vehicle_state_metric: str = os.getenv("VEHICLE_STATE_METRIC", "vehicle_state")
     mission_post_landing_media_enabled: bool = env_bool("MISSION_POST_LANDING_MEDIA_ENABLED", False)
     mission_post_landing_media_download_enabled: bool = env_bool("MISSION_POST_LANDING_MEDIA_DOWNLOAD_ENABLED", True)
     mission_post_landing_media_format_enabled: bool = env_bool("MISSION_POST_LANDING_MEDIA_FORMAT_ENABLED", True)
@@ -660,6 +657,37 @@ class GimbalBridge:
                 return candidate
         return None
 
+    async def _handle_mavlink_mission_current(self, message) -> None:
+        sequence = self._coerce_int(getattr(message, "seq", None))
+        if sequence is None:
+            return
+        self.current_mission_progress_index = sequence
+        if not self.active_mission_waypoints:
+            await self._ensure_active_mission_snapshot()
+        self._schedule_waypoint_action_from_runtime_state("mavlink:mission_current")
+
+    async def _handle_mavlink_global_position_int(self, message) -> None:
+        latitude_raw = getattr(message, "lat", None)
+        longitude_raw = getattr(message, "lon", None)
+        if latitude_raw is not None and longitude_raw is not None:
+            self.current_location_latitude = float(latitude_raw) / 1e7
+            self.current_location_longitude = float(longitude_raw) / 1e7
+
+        vx = getattr(message, "vx", None)
+        vy = getattr(message, "vy", None)
+        if vx is not None and vy is not None:
+            self.current_ground_speed_mps = math.sqrt(float(vx) ** 2 + float(vy) ** 2) / 100.0
+        self._schedule_waypoint_action_from_runtime_state("mavlink:global_position_int")
+
+    async def _handle_mavlink_vfr_hud(self, message) -> None:
+        groundspeed = self._coerce_float(getattr(message, "groundspeed", None))
+        if groundspeed is not None:
+            self.current_ground_speed_mps = groundspeed
+        airspeed = self._coerce_float(getattr(message, "airspeed", None))
+        if airspeed is not None and airspeed > 0:
+            self.current_flight_speed_mps = airspeed
+        self._schedule_waypoint_action_from_runtime_state("mavlink:vfr_hud")
+
     async def _refresh_active_mission_snapshot(self, force: bool = False) -> None:
         if not self.settings.mission_event_camera_actions_enabled:
             return
@@ -781,37 +809,28 @@ class GimbalBridge:
             if task is asyncio.current_task():
                 self.scheduled_waypoint_action_tasks.pop(action_key, None)
 
-    def _schedule_waypoint_action_from_eta(
+    def _schedule_waypoint_action_immediate(
         self,
         action_key: tuple[int | None, int | None, int | None, int | None, str],
         action: str,
         waypoint: dict[str, Any],
         source_event: str,
-        eta_seconds: float,
     ) -> None:
         if action_key in self.completed_waypoint_action_keys:
             return
 
-        delay_seconds = max(0.0, eta_seconds - self.settings.mission_event_camera_action_eta_offset_seconds)
         existing_task = self.scheduled_waypoint_action_tasks.get(action_key)
         if existing_task is not None and not existing_task.done():
-            existing_task.cancel()
+            return
 
         self.scheduled_waypoint_action_tasks[action_key] = asyncio.create_task(
             self._run_scheduled_waypoint_action(
-                delay_seconds,
+                0.0,
                 action_key,
                 action,
                 dict(waypoint),
-                f"{source_event}:eta",
+                source_event,
             )
-        )
-        logger.info(
-            "scheduled waypoint action=%s via %s with eta %.2fs and effective delay %.2fs",
-            action_key,
-            source_event,
-            eta_seconds,
-            delay_seconds,
         )
 
     def _schedule_waypoint_action_from_runtime_state(self, source_event: str) -> None:
@@ -825,13 +844,11 @@ class GimbalBridge:
 
         latitude = self._coerce_float(waypoint.get("latitude"))
         longitude = self._coerce_float(waypoint.get("longitude"))
-        speed_mps = self._current_speed_mps()
         if (
             latitude is None
             or longitude is None
             or self.current_location_latitude is None
             or self.current_location_longitude is None
-            or speed_mps is None
         ):
             return
 
@@ -841,17 +858,22 @@ class GimbalBridge:
             latitude,
             longitude,
         )
-        eta_seconds = distance_m / speed_mps if speed_mps > 0 else None
-        if eta_seconds is None:
+        if distance_m > self.settings.mission_waypoint_action_trigger_distance_meters:
             return
 
         action_key = self._extract_waypoint_action_key(waypoint, action)
-        self._schedule_waypoint_action_from_eta(
+        logger.info(
+            "trigger radius reached for waypoint action=%s via %s at distance %.2fm (threshold %.2fm)",
+            action_key,
+            source_event,
+            distance_m,
+            self.settings.mission_waypoint_action_trigger_distance_meters,
+        )
+        self._schedule_waypoint_action_immediate(
             action_key,
             action,
             waypoint,
             source_event,
-            eta_seconds,
         )
 
     async def _process_post_landing_media(self, payload: dict[str, Any]) -> None:
@@ -1047,42 +1069,6 @@ class GimbalBridge:
         if should_refresh:
             await self._ensure_active_mission_snapshot(force=True)
 
-    async def _handle_mission_progress(self, payload: dict[str, Any]) -> None:
-        if not self.settings.mission_event_camera_actions_enabled:
-            return
-
-        current_waypoint = self._coerce_int(payload.get("current_waypoint"))
-        if current_waypoint is None:
-            return
-        self.current_mission_progress_index = current_waypoint
-        if not self.active_mission_waypoints:
-            await self._ensure_active_mission_snapshot()
-        self._schedule_waypoint_action_from_runtime_state("mission_progress")
-
-    async def _handle_location(self, payload: dict[str, Any]) -> None:
-        if not self.settings.mission_event_camera_actions_enabled:
-            return
-
-        latitude = self._coerce_float(payload.get("latitude"))
-        longitude = self._coerce_float(payload.get("longitude"))
-        ground_speed = self._coerce_float(payload.get("ground_speed"))
-        if latitude is not None:
-            self.current_location_latitude = latitude
-        if longitude is not None:
-            self.current_location_longitude = longitude
-        if ground_speed is not None:
-            self.current_ground_speed_mps = ground_speed
-        self._schedule_waypoint_action_from_runtime_state("location")
-
-    async def _handle_vehicle_state(self, payload: dict[str, Any]) -> None:
-        if not self.settings.mission_event_camera_actions_enabled:
-            return
-
-        flight_speed = self._coerce_float(payload.get("flight_speed"))
-        if flight_speed is not None:
-            self.current_flight_speed_mps = flight_speed
-        self._schedule_waypoint_action_from_runtime_state("vehicle_state")
-
     async def _stop_recording_after(
         self,
         duration_seconds: float,
@@ -1131,16 +1117,6 @@ class GimbalBridge:
         if metric == self.settings.mission_status_metric.lower():
             await self._handle_mission_status(payload)
             return
-        if metric == self.settings.mission_progress_metric.lower():
-            await self._handle_mission_progress(payload)
-            return
-        if metric == self.settings.location_metric.lower():
-            await self._handle_location(payload)
-            return
-        if metric == self.settings.vehicle_state_metric.lower():
-            await self._handle_vehicle_state(payload)
-            return
-
         return
 
     async def publish_metric(self, metric: str, payload: dict[str, Any], interval_seconds: float) -> None:
@@ -1176,37 +1152,51 @@ class GimbalBridge:
             if message is None:
                 continue
 
-            if message.get_type() != "GIMBAL_DEVICE_ATTITUDE_STATUS":
+            message_type = message.get_type()
+
+            if message_type == "GIMBAL_DEVICE_ATTITUDE_STATUS":
+                self.last_status_at = time.monotonic()
+                if not self.connected:
+                    self.connected = True
+
+                roll_deg, pitch_deg, yaw_deg = quaternion_to_euler_degrees(list(message.q))
+                payload = compact_payload(
+                    {
+                        "connected": True,
+                        "gimbal_device_id": message.get_srcComponent(),
+                        "frame": self._frame_label_from_flags(int(message.flags)),
+                        "roll_deg": round(roll_deg, 2),
+                        "pitch_deg": round(pitch_deg, 2),
+                        "yaw_deg": round(yaw_deg, 2),
+                        "roll_rate_dps": None
+                        if is_nan(message.angular_velocity_x)
+                        else round(math.degrees(message.angular_velocity_x), 2),
+                        "pitch_rate_dps": None
+                        if is_nan(message.angular_velocity_y)
+                        else round(math.degrees(message.angular_velocity_y), 2),
+                        "yaw_rate_dps": None
+                        if is_nan(message.angular_velocity_z)
+                        else round(math.degrees(message.angular_velocity_z), 2),
+                        "flags": int(message.flags),
+                        "failure_flags": int(message.failure_flags),
+                        "time_boot_ms": int(message.time_boot_ms),
+                    }
+                )
+                await self.publish_state(payload)
                 continue
 
-            self.last_status_at = time.monotonic()
-            if not self.connected:
-                self.connected = True
+            if not self.settings.mission_event_camera_actions_enabled:
+                continue
 
-            roll_deg, pitch_deg, yaw_deg = quaternion_to_euler_degrees(list(message.q))
-            payload = compact_payload(
-                {
-                    "connected": True,
-                    "gimbal_device_id": message.get_srcComponent(),
-                    "frame": self._frame_label_from_flags(int(message.flags)),
-                    "roll_deg": round(roll_deg, 2),
-                    "pitch_deg": round(pitch_deg, 2),
-                    "yaw_deg": round(yaw_deg, 2),
-                    "roll_rate_dps": None
-                    if is_nan(message.angular_velocity_x)
-                    else round(math.degrees(message.angular_velocity_x), 2),
-                    "pitch_rate_dps": None
-                    if is_nan(message.angular_velocity_y)
-                    else round(math.degrees(message.angular_velocity_y), 2),
-                    "yaw_rate_dps": None
-                    if is_nan(message.angular_velocity_z)
-                    else round(math.degrees(message.angular_velocity_z), 2),
-                    "flags": int(message.flags),
-                    "failure_flags": int(message.failure_flags),
-                    "time_boot_ms": int(message.time_boot_ms),
-                }
-            )
-            await self.publish_state(payload)
+            if message_type == "MISSION_CURRENT":
+                await self._handle_mavlink_mission_current(message)
+                continue
+            if message_type == "GLOBAL_POSITION_INT":
+                await self._handle_mavlink_global_position_int(message)
+                continue
+            if message_type == "VFR_HUD":
+                await self._handle_mavlink_vfr_hud(message)
+                continue
 
     async def connection_state_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -1264,9 +1254,6 @@ class GimbalBridge:
                 [
                     self.settings.mission_event_metric,
                     self.settings.mission_status_metric,
-                    self.settings.mission_progress_metric,
-                    self.settings.location_metric,
-                    self.settings.vehicle_state_metric,
                 ]
             )
         tasks = [
