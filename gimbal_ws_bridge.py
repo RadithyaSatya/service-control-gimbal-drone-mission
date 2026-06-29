@@ -331,6 +331,7 @@ class GimbalBridge:
         self.last_mission_snapshot_refresh_at: float = 0.0
         self.mission_snapshot_refresh_task: asyncio.Task | None = None
         self.completed_waypoint_action_keys: set[tuple[int | None, int | None, int | None, int | None, str]] = set()
+        self.inflight_waypoint_action_keys: set[tuple[int | None, int | None, int | None, int | None, str]] = set()
         self.scheduled_waypoint_action_tasks: dict[
             tuple[int | None, int | None, int | None, int | None, str],
             asyncio.Task,
@@ -549,11 +550,17 @@ class GimbalBridge:
             logger.warning("ignoring camera command because SIYI camera is disabled")
             return
 
+        command_name = str(payload.get("command", "unknown"))
+        started_at = time.monotonic()
         try:
+            logger.info("sending camera command=%s payload=%s", command_name, payload)
             state = await asyncio.to_thread(self.camera.execute_command, payload)
         except Exception as exc:
             logger.warning("camera command failed: %s", exc)
             return
+        finally:
+            elapsed = time.monotonic() - started_at
+            logger.info("camera command finished command=%s elapsed=%.3fs", command_name, elapsed)
 
         await self.publish_metric(
             self.settings.camera_state_metric,
@@ -599,6 +606,7 @@ class GimbalBridge:
             task.cancel()
         self.scheduled_waypoint_action_tasks.clear()
         self.completed_waypoint_action_keys.clear()
+        self.inflight_waypoint_action_keys.clear()
         self.active_recording_waypoint_key = None
 
     def _extract_waypoint_action_key(
@@ -746,47 +754,51 @@ class GimbalBridge:
         waypoint: dict[str, Any],
         source_event: str,
     ) -> None:
-        if action_key in self.completed_waypoint_action_keys:
+        if action_key in self.completed_waypoint_action_keys or action_key in self.inflight_waypoint_action_keys:
             return
+        self.inflight_waypoint_action_keys.add(action_key)
 
-        scheduled_task = self.scheduled_waypoint_action_tasks.pop(action_key, None)
-        current_task = asyncio.current_task()
-        if scheduled_task is not None and scheduled_task is not current_task and not scheduled_task.done():
-            scheduled_task.cancel()
+        try:
+            scheduled_task = self.scheduled_waypoint_action_tasks.pop(action_key, None)
+            current_task = asyncio.current_task()
+            if scheduled_task is not None and scheduled_task is not current_task and not scheduled_task.done():
+                scheduled_task.cancel()
 
-        if action == "take picture":
-            await self._handle_camera_command({"command": "take_photo"})
+            if action == "take picture":
+                await self._handle_camera_command({"command": "take_photo"})
+                self.completed_waypoint_action_keys.add(action_key)
+                logger.info("triggered take_photo for waypoint action=%s via %s", action_key, source_event)
+                return
+
+            if self.active_recording_waypoint_key == action_key:
+                return
+
+            duration_seconds = self._coerce_float(waypoint.get("action_duration"))
+            if duration_seconds is None:
+                logger.warning("record video waypoint requires numeric action_duration, got=%r", waypoint)
+                return
+            if duration_seconds <= 0:
+                logger.warning("record video waypoint requires action_duration > 0, got=%s", duration_seconds)
+                return
+
+            if self.recording_stop_task is not None:
+                self.recording_stop_task.cancel()
+                self.recording_stop_task = None
+
+            self.active_recording_waypoint_key = action_key
+            await self._handle_camera_command({"command": "set_recording", "enabled": True})
             self.completed_waypoint_action_keys.add(action_key)
-            logger.info("triggered take_photo for waypoint action=%s via %s", action_key, source_event)
-            return
-
-        if self.active_recording_waypoint_key == action_key:
-            return
-
-        duration_seconds = self._coerce_float(waypoint.get("action_duration"))
-        if duration_seconds is None:
-            logger.warning("record video waypoint requires numeric action_duration, got=%r", waypoint)
-            return
-        if duration_seconds <= 0:
-            logger.warning("record video waypoint requires action_duration > 0, got=%s", duration_seconds)
-            return
-
-        if self.recording_stop_task is not None:
-            self.recording_stop_task.cancel()
-            self.recording_stop_task = None
-
-        await self._handle_camera_command({"command": "set_recording", "enabled": True})
-        self.active_recording_waypoint_key = action_key
-        self.completed_waypoint_action_keys.add(action_key)
-        self.recording_stop_task = asyncio.create_task(
-            self._stop_recording_after(duration_seconds, action_key)
-        )
-        logger.info(
-            "started recording for waypoint action=%s via %s, stopping after %.2fs",
-            action_key,
-            source_event,
-            duration_seconds,
-        )
+            self.recording_stop_task = asyncio.create_task(
+                self._stop_recording_after(duration_seconds, action_key)
+            )
+            logger.info(
+                "started recording for waypoint action=%s via %s, stopping after %.2fs",
+                action_key,
+                source_event,
+                duration_seconds,
+            )
+        finally:
+            self.inflight_waypoint_action_keys.discard(action_key)
 
     async def _run_scheduled_waypoint_action(
         self,
@@ -816,7 +828,7 @@ class GimbalBridge:
         waypoint: dict[str, Any],
         source_event: str,
     ) -> None:
-        if action_key in self.completed_waypoint_action_keys:
+        if action_key in self.completed_waypoint_action_keys or action_key in self.inflight_waypoint_action_keys:
             return
 
         existing_task = self.scheduled_waypoint_action_tasks.get(action_key)
@@ -862,6 +874,8 @@ class GimbalBridge:
             return
 
         action_key = self._extract_waypoint_action_key(waypoint, action)
+        if action_key in self.completed_waypoint_action_keys or action_key in self.inflight_waypoint_action_keys:
+            return
         logger.info(
             "trigger radius reached for waypoint action=%s via %s at distance %.2fm (threshold %.2fm)",
             action_key,
@@ -1027,6 +1041,18 @@ class GimbalBridge:
                     "download_root": history_media_dir if self.settings.mission_post_landing_media_download_enabled else None,
                     "failure_reason": failure_reason,
                 }
+            )
+            logger.info(
+                "media processing finished for history_id=%s result=%s download_ok=%s format_ok=%s delivery_ok=%s downloaded=%s failed=%s delivered=%s delivery_failed=%s",
+                history_id_value,
+                result_event,
+                download_ok,
+                format_ok,
+                delivery_ok,
+                downloaded_file_count,
+                failed_file_count,
+                delivered_file_count,
+                delivery_failed_file_count,
             )
             await self._publish_mission_event(confirmation_payload)
             self.active_media_processing_history_id = None
