@@ -70,6 +70,15 @@ Flow:
 5. service publishes `gimbal_state`
 6. service translates `camera_command` to SIYI SDK calls and publishes `camera_state`
 
+Post-landing media flow:
+
+1. download media from camera SD card to local storage
+2. format camera SD card after local download finishes
+3. if format succeeds, continue with delivery mode:
+4. `local_only`: stop after local copy + format
+5. `upload`: upload downloaded files from local storage to backend
+6. `register_move`: move downloaded files to register root, then call backend register endpoint
+
 ## Run The Bridge
 
 ```bash

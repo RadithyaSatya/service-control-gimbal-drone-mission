@@ -543,6 +543,8 @@ class GimbalBridge:
             if delivery_mode != "local_only" and not self.settings.mission_post_landing_media_download_enabled:
                 raise RuntimeError("download step must be enabled for upload/register_move delivery mode")
 
+            downloaded_files: list[str] = []
+
             if self.settings.mission_post_landing_media_download_enabled:
                 download_result = await asyncio.wait_for(
                     asyncio.to_thread(
@@ -558,7 +560,25 @@ class GimbalBridge:
                 if not download_ok and failed_file_count > 0:
                     failure_reason = "; ".join(download_result.get("errors", [])[:3]) or "one or more media downloads failed"
                 downloaded_files = list(download_result.get("downloaded_files", []))
+            else:
+                download_ok = True
 
+            if self.settings.mission_post_landing_media_format_enabled:
+                elapsed = time.monotonic() - started_at
+                remaining = self.settings.mission_post_landing_media_timeout_sec - elapsed
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                format_result = await asyncio.wait_for(
+                    asyncio.to_thread(self.camera.format_sd_card),
+                    timeout=remaining,
+                )
+                format_ok = bool(format_result.get("format_ok"))
+                if not format_ok and failure_reason is None:
+                    failure_reason = "format SD card reported failure"
+            else:
+                format_ok = True
+
+            if download_ok and format_ok:
                 if delivery_mode == "upload":
                     elapsed = time.monotonic() - started_at
                     remaining = self.settings.mission_post_landing_media_timeout_sec - elapsed
@@ -600,20 +620,7 @@ class GimbalBridge:
                 else:
                     delivery_ok = True
             else:
-                delivery_ok = True
-
-            if self.settings.mission_post_landing_media_format_enabled:
-                elapsed = time.monotonic() - started_at
-                remaining = self.settings.mission_post_landing_media_timeout_sec - elapsed
-                if remaining <= 0:
-                    raise asyncio.TimeoutError()
-                format_result = await asyncio.wait_for(
-                    asyncio.to_thread(self.camera.format_sd_card),
-                    timeout=remaining,
-                )
-                format_ok = bool(format_result.get("format_ok"))
-                if not format_ok and failure_reason is None:
-                    failure_reason = "format SD card reported failure"
+                delivery_ok = delivery_mode == "local_only"
 
             if (download_ok is False or delivery_ok is False or format_ok is False) and result_event != "media_processing_timeout":
                 result_event = "media_processing_failed"
