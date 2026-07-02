@@ -113,7 +113,6 @@ GIMBAL_COMMAND_METRIC=gimbal_command
 GIMBAL_STATE_METRIC=gimbal_state
 CAMERA_COMMAND_METRIC=camera_command
 CAMERA_STATE_METRIC=camera_state
-MISSION_WAYPOINT_ACTION_TRIGGER_DISTANCE_METERS=3
 ```
 
 Notes:
@@ -122,15 +121,7 @@ Notes:
 * `MAVLINK_SOURCE_*` is the sender identity used by this bridge when transmitting MAVLink commands.
 * `MAVLINK_GIMBAL_*` is the target identity used for `MAV_CMD_DO_GIMBAL_MANAGER_PITCHYAW`.
 * `SIYI_ENABLED=true` enables camera control through the SIYI SDK.
-* `MISSION_WAYPOINT_ACTION_TRIGGER_DISTANCE_METERS` is the trigger radius to the active waypoint for auto photo/video actions.
-* `MISSION_SNAPSHOT_REFRESH_INTERVAL_SECONDS` controls how often the bridge refreshes the active mission snapshot from backend when waypoint runtime data is needed.
-
-Mission camera actions:
-
-* The bridge reads waypoint actions from the active mission snapshot returned by `GET /missions/safe-to-fly/device`.
-* Runtime timing uses local MAVLink messages from the same endpoint as gimbal control, primarily `MISSION_CURRENT`, `GLOBAL_POSITION_INT`, and `VFR_HUD`.
-* `take picture` and `record video` are triggered when MAVLink position enters the configured radius of the active waypoint, not from a custom `waypoint_reached` event payload.
-* Backend realtime is still used for mission metadata refresh and non-timing mission events such as media processing requests.
+* Mission realtime integration is only used for optional post-landing media processing requests.
 
 ## Realtime Metrics
 
